@@ -5,7 +5,7 @@ services:
     command: start --insecure --advertise-addr=cockroach1 --join=cockroach1,cockroach2,cockroach3 --listen-addr=0.0.0.0
     ports:
       - "26257:26257"  # SQL port
-      - "8080:8080"    # Admin UI
+      - "8085:8080"    # Admin UI (8085 sur l'hôte : le port 8080 est déjà occupé localement)
     volumes:
       - cockroach_data1:/cockroach/cockroach-data
     networks:

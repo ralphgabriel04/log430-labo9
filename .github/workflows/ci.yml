@@ -1,0 +1,107 @@
+name: CI/CD - Distributed DB (CockroachDB)
+
+# Pipeline du Labo 09 (BD retenue : CockroachDB — voir docs/adr/adr001.md) :
+#   1. Build + démarrage du cluster CockroachDB (3 nœuds) + app Flask
+#   2. Exécution du test de concurrence (concurrency_test.py)
+#   3. Vérification que le verrou distribué a bien limité le stock à 0
+#   4. Déploiement sur la VM (uniquement sur la branche main, après succès des tests)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # ÉTAPE 1 — Test de concurrence sur un cluster YugabyteDB éphémère
+  # ---------------------------------------------------------------------------
+  concurrency-test:
+    name: Test de concurrence (verrous distribués)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cockroach-db
+
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      - name: Création du fichier .env
+        run: cp .env.example .env
+
+      - name: Démarrage du cluster CockroachDB + app Flask
+        run: docker compose up -d --build
+
+      - name: Attente que l'application soit prête (/health)
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:5000/health; then
+              echo ""
+              echo "Application prête après $((i*5))s."
+              exit 0
+            fi
+            echo "En attente de l'application... ($i/60)"
+            sleep 5
+          done
+          echo "::error::L'application n'a pas démarré à temps."
+          docker compose ps
+          docker compose logs --tail=100
+          exit 1
+
+      - name: Installation des dépendances Python du test
+        run: pip install requests
+
+      - name: Exécution du test de concurrence (20 threads, article 3)
+        run: |
+          export PYTHONPATH="$PWD/src"
+          python src/tests/concurrency_test.py --threads 20 --product 3
+
+      - name: Vérification du verrou distribué (stock article 3 == 0)
+        run: |
+          stock=$(curl -s http://localhost:5000/stocks \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); print(next(x['quantity'] for x in d if x['product_id']==3))")
+          echo "Stock final de l'article 3 = $stock"
+          if [ "$stock" -ne 0 ]; then
+            echo "::error::Le verrou distribué a échoué : stock attendu 0, obtenu $stock"
+            exit 1
+          fi
+          echo "Verrou distribué validé : aucune survente détectée."
+
+      - name: Logs de l'application (diagnostic)
+        if: always()
+        run: docker compose logs --tail=80 python-app || true
+
+      - name: Arrêt et nettoyage du cluster
+        if: always()
+        run: docker compose down -v
+
+  # ---------------------------------------------------------------------------
+  # ÉTAPE 2 — Déploiement sur la VM (après succès des tests, sur main seulement)
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Déploiement sur la VM de production
+    needs: concurrency-test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      - name: Déploiement via SSH sur la VM
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          script: |
+            set -e
+            cd ~/log430-labo9 || git clone https://github.com/ralphgabriel04/log430-labo9.git ~/log430-labo9 && cd ~/log430-labo9
+            git pull origin main
+            cd cockroach-db
+            cp -n .env.example .env || true
+            docker compose pull || true
+            docker compose up -d --build
+            echo "Déploiement terminé sur la VM."
