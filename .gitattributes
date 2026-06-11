@@ -6,6 +6,3 @@
 Dockerfile text eol=lf
 *.yml  text eol=lf
 *.yaml text eol=lf
-
-# Artefacts d'outils externes (hors labo)
-.cto-toolkit/
