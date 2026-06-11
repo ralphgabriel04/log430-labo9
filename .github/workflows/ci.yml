@@ -87,10 +87,23 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
     steps:
+      - name: Vérifier la présence des secrets de la VM
+        id: check
+        run: |
+          if [ -n "${{ secrets.VM_HOST }}" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "Secrets VM présents → déploiement activé."
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Aucun secret VM (VM_HOST/VM_USER/VM_SSH_KEY) configuré — étape de déploiement ignorée. Configurez-les dans Settings → Secrets pour activer le déploiement automatique."
+          fi
+
       - name: Checkout du code
+        if: steps.check.outputs.ready == 'true'
         uses: actions/checkout@v4
 
       - name: Déploiement via SSH sur la VM
+        if: steps.check.outputs.ready == 'true'
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VM_HOST }}
