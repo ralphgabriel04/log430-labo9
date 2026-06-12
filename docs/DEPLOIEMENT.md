@@ -12,8 +12,8 @@ et le pipeline CI/CD (`.github/workflows/ci.yml`).
 Après les tests de charge du Labo 09 (activités 3 et 5), nous avons retenu **CockroachDB**
 comme base de données distribuée de production. Justification :
 
-- **Performances supérieures** dans nos tests : débit ×2.25 (57 vs 25 req/s) et latence ÷3
-  (468 vs 1389 ms) par rapport à YugabyteDB, sur des paramètres Locust identiques ;
+- **Performances supérieures** dans nos tests : débit ×2.1 (54 vs 25 req/s) et latence ÷2.7
+  (518 vs 1389 ms) par rapport à YugabyteDB, sur des paramètres Locust identiques ;
 - Distribution et réplication natives (consensus **MultiRaft**) sans point de défaillance unique ;
 - Compatibilité PostgreSQL (le pilote `psycopg2` et SQLAlchemy fonctionnent sans modification) ;
 - Isolation **SERIALIZABLE** par défaut, qui gère nativement les conflits transactionnels.

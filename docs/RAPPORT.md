@@ -8,19 +8,15 @@
 
 ## Introduction
 
-Ce laboratoire compare deux bases de données distribuées open source, **YugabyteDB** et
-**CockroachDB**, sous forte concurrence. Nous y étudions :
+Dans ce labo, j'ai comparé deux bases de données distribuées open source, YugabyteDB et
+CockroachDB, sous forte concurrence. Quatre choses m'intéressaient : comment les données se
+répliquent dans un cluster à trois nœuds, comment se comportent deux stratégies de verrouillage
+(pessimiste avec `SELECT … FOR UPDATE`, et optimiste avec une colonne `version`), quel débit et
+quel taux d'erreurs on obtient sous charge, et ce qui se passe quand un nœud tombe.
 
-- l'organisation et la réplication des données dans un cluster à trois nœuds ;
-- deux stratégies de contrôle de concurrence : le **verrouillage pessimiste**
-  (`SELECT … FOR UPDATE`) et le **verrouillage optimiste** (colonne `version` +
-  `UPDATE` conditionnel) ;
-- le débit et le taux d'erreurs sous charge soutenue (test Locust) ;
-- la résilience du cluster lors de la panne d'un nœud (consensus Raft).
-
-L'application utilisée est une version simplifiée de *Store Manager* : une API Flask
-exposant deux endpoints de création de commande (`/orders/pessimistic` et
-`/orders/optimistic`) qui décrémentent le stock d'un article.
+L'application est une version réduite de *Store Manager* : une API Flask avec deux endpoints de
+création de commande, `/orders/pessimistic` et `/orders/optimistic`, qui décrémentent le stock
+d'un article.
 
 ---
 
@@ -35,37 +31,40 @@ Client / Test (concurrency_test.py, Locust)
         ▼
    Cluster distribué (3 nœuds)
    ┌───────────┬───────────┬───────────┐
-   │ yugabyte1 │ yugabyte2 │ yugabyte3 │   ← réplication + consensus Raft
+   │ yugabyte1 │ yugabyte2 │ yugabyte3 │   réplication + consensus Raft
    └───────────┴───────────┴───────────┘
 ```
 
-- **yugabyte1** est joignable en YSQL (port 5433) ; les tables sont fragmentées en
-  *tablets* répartis entre les nœuds.
-- Le conteneur `db-init` exécute `init.sql` (création des tables + données de test),
-  puis s'arrête (comportement normal).
-- L'article **ID 3** (« Gadget XYZ ») a un stock initial de **2 unités** : c'est l'article
-  « sous contention » utilisé pour tester les verrous.
+Quelques points à retenir :
+
+- yugabyte1 est joignable en YSQL (port 5433). Les tables sont découpées en *tablets* répartis
+  entre les nœuds.
+- Le conteneur `db-init` exécute `init.sql` (tables + données de test) puis s'arrête. C'est
+  normal, il a juste fini son travail.
+- L'article numéro 3 (« Gadget XYZ ») démarre avec un stock de 2 unités. C'est lui qui sert de
+  cobaye pour tester les verrous, parce qu'avec un stock aussi bas la moindre faille de
+  verrouillage se voit tout de suite.
 
 ### Les deux stratégies de verrouillage (`order_controller.py`)
 
-**Verrouillage pessimiste** — `create_order_pessimistic` :
+Le verrouillage pessimiste, dans `create_order_pessimistic` :
 ```python
 stock = session.query(Stock).filter(Stock.product_id == pid).with_for_update().one_or_none()
 ```
-La ligne de stock est verrouillée dès la lecture (`SELECT … FOR UPDATE`). Toute autre
-transaction qui veut la même ligne **attend** que la première valide (commit) ou annule
-(rollback). Aucune survente possible, au prix d'une latence accrue sous contention.
+La ligne de stock est verrouillée dès la lecture. Une autre transaction qui veut la même ligne
+attend que la première se termine (commit ou rollback). C'est imparable contre la survente, mais
+ça coûte de la latence dès qu'il y a de la contention.
 
-**Verrouillage optimiste** — `create_order_optimistic` :
+Le verrouillage optimiste, dans `create_order_optimistic` :
 ```python
 # 1. lire quantité + version (sans verrou)
 # 2. UPDATE stocks SET quantity=:q, version=version+1 WHERE product_id=:pid AND version=:old
 if result.rowcount == 0:      # une autre transaction a déjà modifié la ligne
-    session.rollback()        # → on recommence (jusqu'à max_retries)
+    session.rollback()        # on recommence (jusqu'à max_retries)
 ```
-Aucun verrou à la lecture. Le conflit est détecté à l'écriture : si la `version` a changé,
-l'`UPDATE` n'affecte aucune ligne et la transaction **recommence**. Performant quand les
-conflits sont rares.
+Ici, aucun verrou à la lecture. Le conflit se détecte au moment d'écrire : si la `version` a
+changé entre-temps, l'`UPDATE` ne touche aucune ligne et on recommence. C'est efficace tant que
+les conflits restent rares.
 
 ---
 
@@ -73,7 +72,7 @@ conflits sont rares.
 
 > *Quelle est la sortie du terminal ? La sortie est-elle identique sur yugabyte1, yugabyte2 et yugabyte3 ?*
 
-**Avant le test** — la table `orders` est vide sur tous les nœuds :
+Avant le test, la table `orders` est vide partout :
 ```
 $ ysqlsh -h yugabyte1 -U yugabyte -c "SELECT * FROM orders;"
  id | user_id | total_amount | payment_link | is_paid | created_at
@@ -81,11 +80,11 @@ $ ysqlsh -h yugabyte1 -U yugabyte -c "SELECT * FROM orders;"
 (0 rows)
 ```
 
-**Exécution** de `python tests/concurrency_test.py --threads 5 --product 3` :
-les deux stratégies acceptent exactement **2 commandes** (stock initial de l'article 3 = 2)
-et en rejettent 3 (HTTP 409).
+J'ai ensuite lancé `python tests/concurrency_test.py --threads 5 --product 3`. Les deux
+stratégies acceptent exactement 2 commandes (le stock de départ de l'article 3 vaut 2) et en
+refusent 3 avec un HTTP 409.
 
-**Après le test** — la même requête sur les **trois** nœuds donne une sortie **identique** :
+Après le test, la même requête sur les trois nœuds donne exactement la même sortie :
 ```
 yugabyte1 │ yugabyte2 │ yugabyte3   (sortie identique sur les 3)
  id  | user_id | total_amount
@@ -97,11 +96,17 @@ yugabyte1 │ yugabyte2 │ yugabyte3   (sortie identique sur les 3)
 (4 rows)
 ```
 
-**Interprétation :** la sortie est **identique sur les trois nœuds**. YugabyteDB réplique
-automatiquement les écritures via le consensus **Raft** : peu importe le nœud interrogé,
-on lit le même état cohérent. On note aussi des `id` non séquentiels (1, 2, 3, **101**, …)
-caractéristiques de l'allocation de clés `SERIAL` distribuée (chaque nœud reçoit une plage
-de valeurs pour éviter un point de contention global).
+La sortie est donc identique d'un nœud à l'autre. C'est exactement ce qu'on attend d'une base
+distribuée : YugabyteDB réplique les écritures via le consensus Raft, et peu importe le nœud
+qu'on interroge, on lit le même état. Un détail intéressant : les `id` ne se suivent pas
+(1, 2, 3, puis 101). C'est la signature de l'allocation de clés `SERIAL` en distribué, où chaque
+nœud reçoit sa propre plage de valeurs pour éviter de se battre sur un compteur unique.
+
+![Console YugabyteDB Master : 3 nœuds, rôles leader/follower, facteur de réplication 3](captures/yugabytedb-master-ui.png)
+
+*Console YB-Master. On voit le facteur de réplication à 3, les 3 TServers, et surtout les rôles
+Raft : `yugabyte1` est LEADER, `yugabyte2` et `yugabyte3` sont FOLLOWER. C'est ce nœud leader qui
+coordonne le consensus et garantit que les 3 nœuds renvoient le même état.*
 
 ---
 
@@ -111,25 +116,25 @@ de valeurs pour éviter un point de contention global).
 
 Test : `python tests/concurrency_test.py --threads 20 --product 3` (article 3, stock = 2).
 
-| Stratégie | Succès | Échecs | Latence moy. (succès) | Latence moy. (échecs) | **Latence moy. (totale)** |
-|-----------|:------:|:------:|:---------------------:|:---------------------:|:-------------------------:|
-| **Pessimiste** (`SELECT … FOR UPDATE`) | 2 | 18 | 2.026 s | 2.652 s | **2.589 s** |
-| **Optimiste** (version + `UPDATE`) | 2 | 18 | 1.108 s | 2.066 s | **1.970 s** |
+| Stratégie | Succès | Échecs | Latence moy. (succès) | Latence moy. (échecs) | Latence moy. (totale) |
+|-----------|:------:|:------:|:---------------------:|:---------------------:|:---------------------:|
+| Pessimiste (`SELECT … FOR UPDATE`) | 2 | 18 | 2.026 s | 2.652 s | **2.589 s** |
+| Optimiste (version + `UPDATE`) | 2 | 18 | 1.108 s | 2.066 s | **1.970 s** |
 
-Vérification du stock final (article 3) : `0` → aucune survente, le verrou fonctionne.
+Le stock final de l'article 3 est bien à 0, donc aucune survente :
 ```
 $ curl http://localhost:5000/stocks
 [{"product_id":1,"quantity":1000},{"product_id":2,"quantity":500},
  {"product_id":3,"quantity":0},{"product_id":4,"quantity":90}]
 ```
 
-**Réponse : le verrouillage pessimiste a la latence moyenne la plus élevée (2.589 s contre
-1.970 s).** Avec `SELECT … FOR UPDATE`, les 20 transactions visent la **même ligne de stock**
-et sont **sérialisées** : chacune doit attendre que la précédente libère le verrou
-(commit/rollback). Les threads s'empilent dans une file d'attente, et la latence s'accumule —
-le dernier thread attend tous les autres. En optimiste, il n'y a aucun verrou à la lecture :
-les transactions perdantes échouent **immédiatement** (stock épuisé → `rowcount = 0` → 409)
-sans rester bloquées, d'où une latence moyenne plus faible.
+C'est le pessimiste qui a la latence moyenne la plus élevée, 2.589 s contre 1.970 s. La raison
+tient au verrou. Avec `SELECT … FOR UPDATE`, les 20 transactions visent toutes la même ligne et
+se retrouvent sérialisées : chacune attend que la précédente relâche le verrou. Elles forment une
+file, et la latence s'accumule au fil de la file (le dernier thread attend tous les autres). Côté
+optimiste, il n'y a pas d'attente : une transaction perdante voit tout de suite que le stock est
+épuisé (`rowcount = 0`, puis 409) et rend la main sans rester bloquée. D'où une moyenne plus
+basse.
 
 ---
 
@@ -139,17 +144,33 @@ sans rester bloquées, d'où une latence moyenne plus faible.
 
 Test : `python tests/concurrency_test.py --threads 5 --product 3`.
 
-| Stratégie | Succès | Échecs | Latence moy. (succès) | Latence moy. (échecs) | **Latence moy. (totale)** |
-|-----------|:------:|:------:|:---------------------:|:---------------------:|:-------------------------:|
-| **Pessimiste** | 2 | 3 | 0.908 s | 1.165 s | **1.062 s** |
-| **Optimiste**  | 2 | 3 | 0.320 s | 0.499 s | **0.427 s** |
+| Stratégie | Succès | Échecs | Latence moy. (succès) | Latence moy. (échecs) | Latence moy. (totale) |
+|-----------|:------:|:------:|:---------------------:|:---------------------:|:---------------------:|
+| Pessimiste | 2 | 3 | 0.908 s | 1.165 s | **1.062 s** |
+| Optimiste  | 2 | 3 | 0.320 s | 0.499 s | **0.427 s** |
 
-**Réponse : le verrouillage pessimiste reste celui dont la latence moyenne est la plus élevée
-(1.062 s contre 0.427 s).** La cause est la même qu'à la Q2 — la sérialisation imposée par
-`SELECT … FOR UPDATE` sur la ligne partagée. Avec seulement 5 threads la contention est plus
-faible, donc les latences absolues sont nettement plus basses qu'avec 20 threads (1.062 s vs
-2.589 s en pessimiste), mais l'**écart relatif** entre les deux stratégies persiste : l'attente
-de verrou pénalise toujours l'approche pessimiste.
+Même verdict qu'à la Q2 : le pessimiste reste le plus lent, 1.062 s contre 0.427 s, et pour la
+même raison (la sérialisation sur la ligne partagée). Ce qui change, c'est l'échelle. Avec
+seulement 5 threads, la contention est plus faible et les latences absolues chutent fortement
+(1.062 s ici contre 2.589 s avec 20 threads en pessimiste). L'écart entre les deux stratégies,
+lui, ne disparaît pas : l'attente de verrou pénalise toujours le pessimiste.
+
+---
+
+## Comment fonctionne le test de charge (Locust)
+
+Avant les résultats, un mot sur la mécanique du test, parce qu'elle explique la forme des
+chiffres. Le `locustfile.py` définit deux profils d'utilisateur de poids égal,
+`PessimisticOrderUser` et `OptimisticOrderUser`. Locust répartit donc les 50 utilisateurs à peu
+près moitié-moitié entre les deux endpoints. Chaque utilisateur attend entre 0.1 et 0.5 s entre
+deux requêtes (`wait_time = between(0.1, 0.5)`) et passe une commande d'un article tiré au hasard
+parmi les quatre, dix fois plus souvent qu'il ne consulte `/stocks` (`@task(10)` contre
+`@task(1)`). Au démarrage du test, un *listener* `on_test_start` remet les stocks à leur valeur
+initiale, pour que chaque run parte du même état.
+
+Les paramètres sont identiques pour tous les tests de charge de ce rapport : 50 utilisateurs,
+spawn rate de 5/s, durée de 60 s. C'est ce qui rend la comparaison YugabyteDB / CockroachDB
+honnête : seule la base de données change.
 
 ---
 
@@ -157,29 +178,38 @@ de verrou pénalise toujours l'approche pessimiste.
 
 > *Quelle stratégie affiche le plus bas taux d'erreurs et la plus basse latence moyenne ?*
 
-Paramètres Locust : **50 utilisateurs**, spawn rate **5/s**, durée **60 s**.
+Paramètres Locust : 50 utilisateurs, spawn rate 5/s, durée 60 s.
 
-| Endpoint | Requêtes | Échecs | **Taux d'erreur** | **Latence moy.** | Médiane | Débit (req/s) |
-|----------|:--------:|:------:|:-----------------:|:----------------:|:-------:|:-------------:|
-| `POST /orders/pessimistic` | 741 | 297 | **40.1 %** | **1175 ms** | 530 ms | 13.80 |
-| `POST /orders/optimistic`  | 493 | 263 | **53.3 %** | **1981 ms** | 1200 ms | 9.18 |
+| Endpoint | Requêtes | Échecs | Taux d'erreur | Latence moy. | Médiane | Débit (req/s) |
+|----------|:--------:|:------:|:-------------:|:------------:|:-------:|:-------------:|
+| `POST /orders/pessimistic` | 741 | 297 | 40.1 % | 1175 ms | 530 ms | 13.80 |
+| `POST /orders/optimistic`  | 493 | 263 | 53.3 % | 1981 ms | 1200 ms | 9.18 |
 | `GET /stocks` | 123 | 0 | 0.0 % | 308 ms | 180 ms | 2.29 |
-| **Agrégé** | 1357 | 560 | 41.2 % | 1389 ms | 800 ms | 25.27 |
+| Agrégé | 1357 | 560 | 41.2 % | 1389 ms | 800 ms | 25.27 |
 
-> Note : les « échecs » sont des réponses **HTTP 409** légitimes (stock épuisé sur les articles
-> 3 et 4, ou retries optimistes épuisés), et non des erreurs d'infrastructure. Le `GET /stocks`
-> affiche 0 % d'erreur. Ce taux reste un bon indicateur **comparatif** entre les deux stratégies.
+Une précision importante avant de conclure : ces « échecs » sont des HTTP 409 légitimes (stock
+épuisé sur les articles 3 et 4, ou réessais optimistes épuisés), pas des pannes d'infrastructure.
+Le `GET /stocks` ne tombe jamais en erreur. Le taux reste quand même utile pour comparer les deux
+stratégies entre elles.
 
-**Réponse : avec YugabyteDB, la stratégie pessimiste l'emporte sur les deux critères** —
-taux d'erreur plus bas (**40.1 % vs 53.3 %**) et latence moyenne plus basse (**1175 ms vs
-1981 ms**), avec en prime un débit supérieur (13.8 vs 9.2 req/s).
+Sur YugabyteDB, c'est le pessimiste qui gagne, et sur les deux tableaux : moins d'erreurs
+(40.1 % contre 53.3 %) et latence plus basse (1175 ms contre 1981 ms), avec un débit supérieur en
+prime (13.8 contre 9.2 req/s).
 
-Ce résultat peut sembler contre-intuitif par rapport à la Q2 (où le pessimiste était plus lent
-sur un *burst* simultané). L'explication : sous **charge soutenue** répartie sur 4 articles,
-l'approche optimiste paie cher ses **réessais** — chaque conflit de `version` relance la
-transaction jusqu'à 5 fois, puis échoue (409) si les tentatives sont épuisées. Le pessimiste,
-lui, met les transactions en file d'attente sans gaspiller de travail : il échoue surtout
-quand le stock est réellement épuisé. D'où moins d'erreurs et une latence moyenne plus faible.
+Ce résultat m'a d'abord surpris, parce qu'à la Q2 le pessimiste était le plus lent. La différence
+vient du type de charge. En *burst* sur une seule ligne, le pessimiste paie son attente de verrou.
+En charge soutenue répartie sur quatre articles, c'est l'optimiste qui se met à souffrir : chaque
+conflit de `version` relance la transaction jusqu'à cinq fois, et finit en 409 si les tentatives
+sont épuisées. Le pessimiste, lui, met en file mais ne gaspille pas de travail, et n'échoue
+vraiment que quand le stock est réellement à zéro.
+
+![Rapport Locust YugabyteDB : statistiques par endpoint et débit requêtes/s](captures/locust-yugabytedb.png)
+
+*Rapport Locust (YugabyteDB), run illustratif. Le `/orders/pessimistic` reste plus rapide en
+moyenne que `/orders/optimistic` (≈ 680 ms contre ≈ 1120 ms sur ce run), et tous les échecs sont
+des HTTP 409 (le `GET /stocks` est à 0). Les valeurs absolues bougent d'un run à l'autre selon la
+charge de la machine ; les chiffres de référence sont ceux du tableau ci-dessus, issus du run
+initial.*
 
 ---
 
@@ -187,38 +217,38 @@ quand le stock est réellement épuisé. D'où moins d'erreurs et une latence mo
 
 > *Le taux d'erreur a-t-il augmenté à l'arrêt d'un nœud ? Combien de temps a duré le basculement ?*
 
-Protocole : test de charge continu (50 utilisateurs, spawn 5/s), puis `docker stop yugabyte2`
-pendant la charge, puis `docker start yugabyte2`. L'historique par seconde (`--csv-full-history`)
-permet de mesurer précisément le basculement.
+Protocole : un test de charge continu (50 utilisateurs, spawn 5/s), un `docker stop yugabyte2`
+pendant la charge, puis un `docker start yugabyte2`. J'ai activé `--csv-full-history` pour avoir
+l'historique seconde par seconde et mesurer le basculement précisément.
 
-**Chronologie (t = 0 à l'arrêt de yugabyte2, 21:47:22 UTC) :**
+Chronologie, avec t = 0 au moment de l'arrêt de yugabyte2 (21:47:22 UTC) :
 
 | Temps relatif | Débit complété | Observation |
 |:-------------:|:--------------:|-------------|
 | t = −2 s | ~49 req/s | Régime normal, 3 nœuds |
 | t = 0 s | `docker stop yugabyte2` | Arrêt du nœud secondaire |
-| **t ≈ +2 s → +17 s** | **~0 req/s** | **Basculement : aucune requête ne se termine** (compteur cumulé figé à 530). Raft ré-élit les *leaders* des tablets qui étaient sur yugabyte2. |
-| t ≈ +19 s → +28 s | 1 → 20 → 47 req/s | Reprise progressive sur les **2 nœuds restants** (quorum 2/3) |
-| t ≈ +37 s | `docker start yugabyte2` | Le nœud rejoint le cluster **sans nouvelle coupure** |
+| t ≈ +2 s à +17 s | ~0 req/s | Plus aucune requête ne se termine (compteur figé à 530). Raft ré-élit les *leaders* des tablets qui vivaient sur yugabyte2. |
+| t ≈ +19 s à +28 s | 1 → 20 → 47 req/s | Reprise progressive sur les 2 nœuds restants (quorum 2/3) |
+| t ≈ +37 s | `docker start yugabyte2` | Le nœud revient sans provoquer de nouvelle coupure |
 
-**Réponses :**
-- **Oui, le taux d'erreur a augmenté**, mais de façon **temporaire**. Pendant ~15 s, le débit
-  effectif est tombé à ~0 (les requêtes en cours restaient bloquées en attente d'un nouveau
-  *leader*), puis les erreurs/timeouts se sont accumulés avant la reprise.
-- **Durée du basculement ≈ 15 secondes.** Après cette fenêtre, le système a retrouvé son débit
-  nominal (~50 req/s) **sur 2 nœuds seulement**, démontrant la haute disponibilité par quorum.
-- Point notable : la récupération a eu lieu **avant même** le redémarrage de yugabyte2 — le
-  cluster a survécu de lui-même à la perte d'un nœud. Le redémarrage n'a causé aucune coupure
-  supplémentaire ; l'application Flask n'a jamais planté.
+Donc oui, le taux d'erreur a augmenté, mais de manière temporaire. Pendant une quinzaine de
+secondes le débit est tombé à zéro (les requêtes en cours attendaient un nouveau *leader*), et les
+timeouts se sont accumulés avant que tout reparte. Le basculement a duré environ 15 secondes.
+Ensuite, le système est revenu à son débit normal d'à peu près 50 req/s en tournant sur seulement
+2 nœuds, ce qui montre bien la haute disponibilité par quorum.
 
-Totaux du run (100 s, dont ~37 s avec un nœud manquant) : 3885 requêtes, 1851 « échecs »
-(47.6 %, majoritairement 409 + timeouts de la fenêtre de basculement). À titre de comparaison,
-le `GET /stocks` n'a enregistré aucune erreur sur l'ensemble du run.
+Le point que je trouve le plus parlant : la récupération s'est faite avant même que je redémarre
+yugabyte2. Le cluster s'est rétabli tout seul après avoir perdu un nœud, et le redémarrage n'a
+causé aucune coupure de plus. L'API Flask, elle, n'a jamais planté.
 
-> **Pourquoi ~15 s ?** YugabyteDB s'appuie sur Raft : à la perte d'un nœud, chaque *tablet* dont
-> le *leader* résidait sur yugabyte2 doit détecter la défaillance puis élire un nouveau *leader*
-> parmi les *followers*. Pendant cette ré-élection (plus la reconnexion des connexions du pool
-> applicatif), les écritures sur ces tablets sont momentanément indisponibles, d'où le creux.
+Sur l'ensemble du run (100 s, dont environ 37 s avec un nœud en moins) : 3885 requêtes et 1851
+« échecs » (47.6 %, surtout des 409 plus les timeouts de la fenêtre de basculement). Le
+`GET /stocks`, lui, n'a enregistré aucune erreur sur tout le run.
+
+> Pourquoi environ 15 secondes ? Avec Raft, quand un nœud disparaît, chaque tablet dont le
+> *leader* était sur ce nœud doit d'abord détecter la panne, puis élire un nouveau *leader* parmi
+> les *followers*. Pendant cette ré-élection (à laquelle s'ajoute la reconnexion du pool de
+> connexions côté application), les écritures sur ces tablets sont indisponibles. D'où le creux.
 
 ---
 
@@ -226,23 +256,32 @@ le `GET /stocks` n'a enregistré aucune erreur sur l'ensemble du run.
 
 > *Quelle stratégie affiche le plus bas taux d'erreurs et la plus basse latence ?*
 
-Mêmes paramètres qu'à la Q4 : **50 utilisateurs**, spawn **5/s**, **60 s**.
+Mêmes paramètres qu'à la Q4 : 50 utilisateurs, spawn 5/s, 60 s.
 
-| Endpoint | Requêtes | Échecs | **Taux d'erreur** | **Latence moy.** | Médiane | Débit (req/s) |
-|----------|:--------:|:------:|:-----------------:|:----------------:|:-------:|:-------------:|
-| `POST /orders/pessimistic` | 1677 | 773 | **46.1 %** | **246 ms** | 150 ms | 37.54 |
-| `POST /orders/optimistic`  | 652 | 499 | **76.5 %** | **1140 ms** | 190 ms | 14.60 |
-| `GET /stocks` | 216 | 0 | 0.0 % | 168 ms | 160 ms | 4.84 |
-| **Agrégé** | 2545 | 1272 | 50.0 % | 468 ms | 160 ms | 56.97 |
+| Endpoint | Requêtes | Échecs | Taux d'erreur | Latence moy. | Médiane | Débit (req/s) |
+|----------|:--------:|:------:|:-------------:|:------------:|:-------:|:-------------:|
+| `POST /orders/pessimistic` | 2106 | 1064 | 50.5 % | 290 ms | 140 ms | 35.81 |
+| `POST /orders/optimistic`  | 811 | 654 | 80.6 % | 1229 ms | 230 ms | 13.79 |
+| `GET /stocks` | 272 | 0 | 0.0 % | 168 ms | 160 ms | 4.63 |
+| Agrégé | 3189 | 1718 | 53.9 % | 518 ms | 160 ms | 54.22 |
 
-**Réponse : avec CockroachDB aussi, la stratégie pessimiste l'emporte nettement** — taux
-d'erreur plus bas (**46.1 % vs 76.5 %**), latence moyenne plus basse (**246 ms vs 1140 ms**)
-et débit bien supérieur (37.5 vs 14.6 req/s). La raison est identique à la Q4 : sous charge
-soutenue, l'approche optimiste gaspille du travail en réessais sur la colonne `version`, alors
-que CockroachDB (isolation **SERIALIZABLE**) résout efficacement les conflits côté verrou.
+Sur CockroachDB le constat est le même que sur YugabyteDB, et il est encore plus tranché : le
+pessimiste gagne avec un taux d'erreur de 50.5 % contre 80.6 %, une latence de 290 ms contre
+1229 ms, et un débit nettement plus haut (35.8 contre 13.8 req/s). L'explication ne change pas :
+sous charge soutenue, l'optimiste se noie dans ses réessais sur la colonne `version`, là où
+CockroachDB, avec son isolation SERIALIZABLE par défaut, règle les conflits efficacement côté
+verrou.
 
-> Vérification complémentaire (`concurrency_test --threads 20`) : 2 commandes acceptées sur 20,
-> stock final = 0 → les verrous fonctionnent correctement sur CockroachDB.
+> J'ai aussi rejoué `concurrency_test --threads 20` sur CockroachDB pour vérifier : 2 commandes
+> acceptées sur 20 et stock final à 0. Les verrous font bien leur travail là aussi.
+
+![Rapport Locust CockroachDB : statistiques par endpoint et débit requêtes/s](captures/locust-cockroachdb.png)
+
+*Rapport Locust (CockroachDB), run illustratif. Le débit agrégé (graphique « Total Requests per
+Second ») tourne autour de 50 req/s, nettement au-dessus de YugabyteDB. Le `/orders/pessimistic`
+reste plus rapide que `/orders/optimistic` et les seuls échecs sont des HTTP 409 (le `GET /stocks`
+est à 0). Comme pour YugabyteDB, les valeurs absolues varient d'un run à l'autre ; les chiffres de
+référence sont ceux du tableau ci-dessus.*
 
 ---
 
@@ -250,72 +289,113 @@ que CockroachDB (isolation **SERIALIZABLE**) résout efficacement les conflits c
 
 > *Quelle base de données affiche le plus bas taux d'erreurs et la plus basse latence ?*
 
-Comparaison directe des deux tests de charge (60 s, 50 utilisateurs, spawn 5/s, locustfile identique) :
+Comparaison directe des deux tests de charge (60 s, 50 utilisateurs, spawn 5/s, locustfile
+identique) :
 
-| Métrique (agrégée) | YugabyteDB | CockroachDB | Gagnant |
-|--------------------|:----------:|:-----------:|:-------:|
-| Requêtes traitées (60 s) | 1357 | **2545** | CockroachDB |
-| **Débit moyen** | 25.3 req/s | **57.0 req/s** | **CockroachDB** (×2.25) |
-| **Latence moyenne** | 1389 ms | **468 ms** | **CockroachDB** (÷3) |
-| Latence médiane | 800 ms | **160 ms** | CockroachDB |
-| Latence pessimiste | 1175 ms | **246 ms** | CockroachDB |
-| Taux d'erreur agrégé | **41.2 %** | 50.0 % | YugabyteDB |
+| Métrique (agrégée) | YugabyteDB | CockroachDB | Meilleur |
+|--------------------|:----------:|:-----------:|:--------:|
+| Requêtes traitées (60 s) | 1357 | 3189 | CockroachDB |
+| Débit moyen | 25.3 req/s | 54.2 req/s | CockroachDB (×2.1) |
+| Latence moyenne | 1389 ms | 518 ms | CockroachDB (÷2.7) |
+| Latence médiane | 800 ms | 160 ms | CockroachDB |
+| Latence pessimiste | 1175 ms | 290 ms | CockroachDB |
+| Taux d'erreur agrégé | 41.2 % | 53.9 % | YugabyteDB |
 | Erreurs `GET /stocks` | 0 % | 0 % | égalité |
 
-Comparaison du *burst* (`concurrency_test --threads 20`, latence moyenne totale) :
+Et le *burst* (`concurrency_test --threads 20`, latence moyenne totale) :
 
 | | YugabyteDB | CockroachDB |
 |---|:---:|:---:|
-| Pessimiste | 2.589 s | **0.174 s** |
-| Optimiste | 1.970 s | **0.315 s** |
+| Pessimiste | 2.589 s | 0.174 s |
+| Optimiste | 1.970 s | 0.315 s |
 
-**Réponse :**
-- **Plus basse latence : CockroachDB**, de façon décisive — latence moyenne ÷3 (468 ms vs
-  1389 ms) et débit ×2,25 (57 vs 25 req/s) sur le test de charge ; et jusqu'à **15× plus rapide**
-  sur le *burst* (0.174 s vs 2.589 s en pessimiste). CockroachDB répond donc clairement à
-  l'objectif du labo : **traiter davantage de requêtes simultanées**.
-- **Plus bas taux d'erreurs : YugabyteDB** (41.2 % vs 50.0 %), mais cet écart est en grande
-  partie un **artefact du débit** : CockroachDB ayant traité presque **2× plus de requêtes**,
-  il a sollicité plus souvent les articles à stock limité (3 et 4), générant mécaniquement
-  plus de rejets 409 légitimes. Le `GET /stocks` affiche 0 % d'erreur sur les deux bases.
+Pour la latence, CockroachDB l'emporte sans discussion : près de trois fois plus rapide en moyenne
+sur le test de charge (518 ms contre 1389 ms), plus de deux fois plus de débit (54 contre
+25 req/s), et jusqu'à quinze fois plus rapide sur le *burst* (0.174 s contre 2.589 s en
+pessimiste). C'est exactement ce que cherche le labo, traiter plus de requêtes simultanées.
 
-**Conclusion de la comparaison : CockroachDB est globalement le plus performant** (latence et
-débit nettement supérieurs). YugabyteDB conserve l'avantage d'être **100 % open source**
-(licence Apache 2.0), là où CockroachDB est passé à un modèle *source available* non gratuit
-pour un usage commercial. Le choix final relève donc d'un compromis **performance vs licence**
-(voir l'ADR `docs/adr/adr001.md`).
+Pour le taux d'erreurs, c'est YugabyteDB qui passe devant (41.2 % contre 53.9 %), mais il faut le
+prendre avec des pincettes : comme CockroachDB a traité plus de deux fois plus de requêtes, il a
+tapé plus souvent dans les articles à faible stock (3 et 4), ce qui génère mécaniquement plus de
+rejets 409 parfaitement légitimes. Le `GET /stocks` reste à 0 % d'erreur des deux côtés.
+
+Au final, CockroachDB est clairement le plus performant ici. Le seul vrai bémol est sa licence :
+il est passé à un modèle *source available*, gratuit pour un usage personnel ou éducatif mais pas
+pour un usage commercial, là où YugabyteDB reste 100 % open source (Apache 2.0). Le choix dépend
+donc de ce qu'on priorise, la performance ou la licence. J'en discute dans l'ADR
+(`docs/adr/adr001.md`).
+
+![Console CockroachDB : cluster à 3 nœuds LIVE](captures/cockroachdb-cluster-ui.png)
+
+*Console d'administration CockroachDB : les 3 nœuds (cockroach1/2/3) sont LIVE, avec leurs ranges
+répliqués. Le bandeau orange illustre d'ailleurs la contrainte de licence évoquée plus haut.*
 
 ---
 
 ## Activité 6 — CI/CD et déploiement
 
-Voir `.github/workflows/ci.yml` (pipeline) et `docs/DEPLOIEMENT.md` (procédure VM).
+Le pipeline (`.github/workflows/ci.yml`) se déclenche à chaque `push` ou `pull_request` sur
+`main`. Il est en deux temps.
+
+Le premier job, *Test de concurrence*, monte un cluster CockroachDB éphémère avec
+`docker compose up -d --build`, attend que l'API réponde sur `/health`, lance
+`concurrency_test.py --threads 20 --product 3`, puis vérifie que le stock de l'article 3 est bien
+retombé à 0. Si jamais le verrou laissait passer une survente, cette étape échouerait et le
+pipeline s'arrêterait là. C'est le cœur de l'idée : on ne déploie pas tant que la cohérence des
+stocks sous concurrence n'est pas prouvée.
+
+Le second job, *Déploiement*, ne tourne que si le premier réussit, sur `main`, en `push`. Il se
+connecte à la VM en SSH et y fait un `git pull` suivi d'un `docker compose up -d --build`. Pour
+qu'il ne casse pas le pipeline tant qu'aucune VM n'est branchée, j'ai ajouté une vérification :
+sans le secret `VM_HOST`, l'étape de déploiement est simplement sautée (et signalée par une
+*notice*), au lieu d'échouer.
+
+J'ai poussé le code et vérifié que le pipeline passe au vert :
+
+![Pipeline GitHub Actions au vert : les deux jobs réussis](captures/ci-github-actions.png)
+
+*Exécution GitHub Actions : statut Success, le job « Test de concurrence » passe en 1m2s et le job
+« Déploiement » se termine en 7s (étape SSH sautée faute de secret VM, comme prévu).*
+
+La procédure complète d'installation sur une VM Ubuntu (Docker, clone, `.env`, démarrage du
+cluster) et la mise en place d'un GitHub *self-hosted runner* sont décrites dans
+`docs/DEPLOIEMENT.md`.
+
+### Problèmes rencontrés et corrections
+
+Quelques pièges m'ont occupé pendant la mise en place, ça vaut la peine de les noter :
+
+- Les scripts `db-init/entrypoint.sh` étaient en **CRLF** (fins de ligne Windows). Dans le
+  conteneur Linux, bash plantait avec `$'\r': command not found`. J'ai converti en LF et ajouté un
+  `.gitattributes` (`eol=lf`) pour que ça ne revienne pas, y compris quand la CI fait son checkout.
+- Le port **8080** de la console CockroachDB était déjà pris sur ma machine : je l'ai remappé sur
+  8085 côté hôte dans le `docker-compose.yml`.
+- Au premier démarrage à froid, `yugabyte3` se faisait tuer (SIGKILL) quand les nœuds 2 et 3
+  rejoignaient le cluster en même temps. Le relancer seul une fois le cluster posé règle le
+  problème.
 
 ---
 
 ## Conclusion
 
-Ce laboratoire a permis d'observer concrètement le comportement de deux bases de données
-distribuées sous forte concurrence.
+Ce labo m'a permis de voir concrètement comment se comportent deux bases distribuées quand on les
+pousse.
 
-**Sur les verrous distribués.** Les deux stratégies empêchent correctement la survente : sur 20
-commandes simultanées d'un article à 2 unités, seules 2 sont acceptées et le stock tombe à 0.
-Leur profil de performance diffère toutefois selon le contexte :
-- en *burst* simultané sur une seule ligne, le verrouillage **pessimiste** sérialise les accès et
-  paie une latence d'attente ;
-- sous **charge soutenue** répartie, c'est l'inverse : le verrouillage **optimiste** se dégrade à
-  cause de ses réessais sur la colonne `version`, et le **pessimiste** devient à la fois plus
-  rapide et moins « en erreur » sur les deux bases de données.
+Du côté des verrous, les deux stratégies bloquent bien la survente : sur 20 commandes simultanées
+d'un article à 2 unités, seules 2 passent et le stock finit à 0. Mais leur performance dépend
+beaucoup du contexte. En *burst* sur une seule ligne, le pessimiste sérialise les accès et paie
+son attente. En charge soutenue, c'est l'inverse, l'optimiste s'effondre à cause de ses réessais
+et le pessimiste devient à la fois plus rapide et moins « en erreur », sur les deux bases.
 
-**Sur la résilience.** YugabyteDB a survécu à la perte d'un nœud grâce au consensus Raft : après
-une fenêtre de basculement d'environ **15 secondes**, le service est revenu à son débit nominal
-sur 2 nœuds seulement, sans intervention et sans plantage applicatif.
+Sur la résilience, YugabyteDB a tenu le coup après la perte d'un nœud grâce à Raft : une
+quinzaine de secondes de basculement, puis retour au débit normal sur 2 nœuds, sans que je touche
+à rien et sans que l'application plante.
 
-**Sur la comparaison des deux bases.** **CockroachDB** s'est révélé nettement plus performant
-(latence ÷3, débit ×2.25, *burst* jusqu'à 15× plus rapide). Il a donc été retenu pour la
-production avec le verrouillage pessimiste, le compromis étant sa licence *source available*
-(gratuite en contexte éducatif). YugabyteDB reste l'alternative open source de référence.
+Pour la comparaison, CockroachDB sort nettement devant en performance (latence divisée par près de
+trois, débit multiplié par deux, *burst* jusqu'à quinze fois plus rapide). C'est lui que je retiens pour
+la production, avec le verrouillage pessimiste, le compromis assumé étant sa licence. YugabyteDB
+reste l'alternative open source si la licence devient un critère bloquant.
 
-**Sur le CI/CD.** Le pipeline `.github/workflows/ci.yml` démarre un cluster éphémère, exécute le
-test de concurrence et **bloque le déploiement** si le verrou distribué laisse passer une
-survente — garantissant qu'aucune régression sur la cohérence des stocks n'atteint la production.
+Enfin, côté CI/CD, le pipeline démarre un cluster éphémère, lance le test de concurrence et
+refuse le déploiement si jamais le verrou laisse passer une survente. C'est ma garde-fou contre
+une régression sur la cohérence des stocks avant la mise en production.

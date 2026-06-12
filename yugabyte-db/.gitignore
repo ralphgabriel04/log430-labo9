@@ -208,3 +208,4 @@ __marimo__/
 
 # Sorties Locust (artefacts de test, conservés dans docs/resultats)
 locustfiles/*.csv
+locustfiles/*.html

@@ -39,6 +39,10 @@ blockquote { border-left: 4px solid #f0a500; background: #fff8e8; margin: 12px 0
 blockquote p { text-align: left; }
 hr { border: none; border-top: 1px solid #d6dde6; margin: 18px 0; }
 strong { color: #0b3d91; }
+img { max-width: 100%; height: auto; display: block; margin: 12px auto 4px auto;
+      border: 1px solid #cdd7e8; border-radius: 4px; page-break-inside: avoid; }
+img + em, p > em:only-child { display: block; text-align: center; font-size: 9pt;
+      color: #555; margin: 0 auto 14px auto; max-width: 92%; }
 """
 
 html = f"""<!DOCTYPE html>
